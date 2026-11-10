@@ -1,0 +1,529 @@
+# Changelog
+
+All notable changes to the **eHub Ecosystem** monorepo are documented here.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+This project does not yet follow semantic versioning per release; entries are
+grouped by delivery.
+
+> **Note on `services/eHubGo`:** it is the legacy monolith used as a migration
+> reference. No changes were made to it in any of the work below.
+
+---
+
+## [Unreleased] — 2026-10-17 — Taxi ride lifecycle
+
+The taxi vertical was discovery-only: `find-driver` returned a candidate and
+nothing persisted the ride, so the flow could not complete without the monolith
+and two riders could be offered the same driver. `dispatch-service` now owns the
+whole lifecycle — `requested → accepted → in_transit → completed`, or
+`cancelled` — and the two rules that make it safe are database invariants rather
+than checks the application hopes to win.
+
+### Added
+
+- `services/dispatch-service/migrations/002_ride_lifecycle.sql` — two partial
+  unique indexes that make "one active ride per driver" and "one open ride per
+  rider" impossible to violate, plus an index for the request feed. Also
+  normalises legacy `taxi_trips.driver_id` values (see *Changed*). Applied as
+  `05_ride_lifecycle.sql` in the compose bootstrap and by `push_to_neon.ps1`.
+- `services/dispatch-service/services/rides.go` — `RideService`: creates trips,
+  lists the requests near a driver, and applies the accept/start/complete/cancel
+  transitions under a row lock. Every write sets the RLS session context.
+- `services/dispatch-service/handlers/rides.go` — the same surface over the
+  service's own HTTP API, for parity with its other routes.
+- `services/gateway/handlers/rides.go` and eight gateway routes: rider-side
+  `POST /dispatch/trips`, `GET /dispatch/trips/:id`,
+  `POST /dispatch/trips/:id/cancel`, `GET /dispatch/ride-history`, and
+  driver-side `GET /dispatch/ride-requests`,
+  `POST /dispatch/trips/:id/{accept,start,complete}`.
+- Eight RPCs on `proto/dispatch/dispatch.proto` (`CreateTrip`,
+  `ListRideRequests`, `AcceptTrip`, `StartTrip`, `CompleteTrip`, `CancelTrip`,
+  `GetTrip`, `ListRideHistory`) and a `Trip` message.
+- Handler tests (`handlers/rides_test.go`) and location-updater tests
+  (`services/driver_location_test.go`).
+
+### Changed
+
+- **`dispatch-service` is now a writer of `taxi_trips`.** `contracts.sql` grants
+  it `SELECT, INSERT, UPDATE` (was `SELECT`), the expected matrix in
+  `verify_contracts.sql` grew to 44 rows, and `OWNERSHIP.md` records the ride
+  lifecycle as contracted. This is the first contract change made because a
+  service gained a write, and the verifier caught both copies as designed.
+- **`taxi_trips.driver_id` means `drivers.id`.** The monolith's accept path
+  stored the driver's *user* id in that column even though it references
+  `drivers(id)`; readers work around it with `d.id = t.driver_id OR d.user_id = t.driver_id`.
+  The migration rewrites the existing rows, and readers stay tolerant, because a
+  user id and a row id cannot be told apart afterwards. The API exposes the
+  driver's **user id** as `Trip.driver_id`, which is what the location index and
+  the mobile client use, so the tracking view resolves the assigned driver.
+- **Driver location is persisted, not only indexed.** `UpdateDriverLocation`
+  wrote Redis only, leaving `drivers.last_location` empty for anyone who used the
+  extracted service; because the request feed and the monolith's nearby queries
+  read that column, such a driver would never see a ride request. A new
+  `services.TrackedLocationUpdater` writes both stores.
+- **The app's taxi flow goes through the gateway.**
+  `createTaxiTrip`, `getTaxiTripStatus`, `getRideRequests` and
+  `acceptRideRequest` now reach `dispatch-service` instead of the monolith;
+  `startRide`, `completeRide`, `cancelTaxiTrip` and `getTaxiRideHistory` were
+  added. `declineRideRequest` was removed: offers are a pull feed, so declining
+  has no server representation.
+
+### Fixed
+
+- `infra/db/push_to_neon.ps1` aborted on the first `psql` `NOTICE`. Windows
+  PowerShell promotes a native command's stderr to a terminating error while
+  `$ErrorActionPreference` is `'Stop'`, so an idempotent "does not exist,
+  skipping" — which every `DROP ... IF EXISTS` in the bootstrap emits on a fresh
+  database — killed the deploy after the third file. Native calls now run with
+  the preference relaxed and the exit code decides. Found while re-testing the
+  script against a scratch database.
+
+### Verification
+
+- The whole lifecycle was driven through the gateway with real session tokens:
+  201 on request, the trip appearing in the driver's feed, then accept → start →
+  complete, with `409` for a rider who already has an open ride, a driver who is
+  already riding, a lost race and an invalid transition; `403` for a non-driver
+  on driver routes, `401` anonymously, and `404` when a stranger reads someone
+  else's trip (the endpoint does not confirm that a trip exists).
+- The database invariant was probed directly, bypassing the service: a second
+  active trip for one driver is rejected with `duplicate key value violates
+  unique constraint "taxi_trips_active_driver_idx"`.
+- Two drivers raced for the same trip: the first accept won, the second received
+  `409`.
+- App compatibility: `trip.driver_id` equals the `driver_id` that
+  `/dispatch/nearby-drivers` returns, which the app normalises to `id`, so
+  `nearbyDrivers.find(d => d.id === trip.driver_id)` matches.
+- `go test ./...` passes in `dispatch-service` (handlers + services) and the
+  gateway.
+
+### Known limits
+
+- **No fare estimate.** `total_amount` is still supplied by the client (the app
+  hardcodes 500); pricing exists as an estimate endpoint but the ride does not
+  call it.
+- **No route.** `CreateTripResponse.polyline` is reserved and always empty, so
+  the map shows markers rather than a line. Dispatch has no routing provider.
+- **Offers are a pull feed, not a pushed offer with a timeout.** Any nearby
+  driver can accept; there is no reservation while a rider waits, and no
+  decline.
+- The monolith's own taxi code is unchanged and outside the contract; it could
+  still write the legacy `driver_id` form for rides it creates.
+
+### Note
+
+`services/eHubGo` was not modified.
+
+---
+
+## [Unreleased] — 2026-10-17 — Database ownership contracts
+
+Each extracted service now connects to Postgres with its own least-privilege
+role, and the set of tables it may read or write is declared in one place and
+enforced by the database. Previously every service connected as the
+superuser/table owner, so any service could read or write any table: the service
+boundaries were real in the process layout but fictional in the data.
+
+### Added
+
+- `infra/db/contracts.sql` — the contract: per-service login roles
+  (`ehub_auth`, `ehub_wallet`, `ehub_dispatch`, `ehub_fulfillment`, `ehub_b2b`,
+  `ehub_c2c`), their `search_path`, and the table grants. Idempotent; applied
+  automatically on a fresh database and re-appliable to an existing one.
+- `infra/db/verify_contracts.sql` — compares the live grants (`pg_class.relacl`)
+  against the declared contract in both directions and raises on any mismatch
+  (a promised privilege that is absent, or a held privilege that is not
+  declared).
+- `infra/db/OWNERSHIP.md` — the table-level matrix (who writes what, who may
+  read it), the rationale, how to change a contract, and the known deviations.
+- `infra/db/push_to_neon.ps1` — deploys the same schema + contract SQL to a Neon
+  database in the compose bootstrap order, then runs `verify_contracts.sql` as a
+  deploy gate. It uses a `psql` from `PATH` or a throwaway PostGIS container (no
+  client install), refuses a target that looks local unless `-AllowLocal`, and
+  can copy reference tables from the local database with `-LoadReferenceData`.
+
+### Changed
+
+- **wallet-service owns the `wallet` schema.** `wallet_*` was the only table set
+  with no writer outside the service (the monolith never references it), so it
+  moved out of `public`. `migrations/001_wallet.sql` now creates the schema and
+  its tables, and `main.go` checks `wallet.wallet_accounts`.
+- All services now connect with their own role through `DATABASE_URL` (compose
+  and README updated). The roles are `NOSUPERUSER` / `NOCREATEROLE` /
+  `NOCREATEDB` and receive only the privileges their code uses: for example
+  `dispatch-service` may `UPDATE` `drivers` and `orders` but may not read the
+  catalogue. Dev passwords are `ehub-dev-<service>` and are not secrets.
+- Each role carries `BYPASSRLS`, deliberately: the monolith's row policies
+  filter on session context (`get_app_user_id()` / `has_role()`) that the
+  extracted services do not set, so enforcing RLS today would silently hide
+  rows from them. Table-level ownership is enforced regardless; dropping
+  `BYPASSRLS` (starting with marketplace-c2c, which already propagates
+  `app.current_user_id`) is the next step.
+
+### Verification
+
+- `verify_contracts.sql` passes against the live database and prints the
+  effective matrix.
+- Probed each role directly: `ehub_b2b` can read `products` but is denied
+  `UPDATE products` and `SELECT users`; `ehub_wallet` can read
+  `wallet.wallet_accounts` but is denied `SELECT orders`; `ehub_dispatch` can
+  `UPDATE orders` but is denied `SELECT products`.
+- Restarted the five Go services with their roles: healthchecks pass, and
+  `pg_stat_activity` shows one connection each for `ehub_auth`, `ehub_wallet`,
+  `ehub_dispatch` and `ehub_fulfillment`.
+- The deploy path was exercised end to end against a scratch database: the five
+  SQL files applied in bootstrap order, `verify_contracts.sql` passed, and
+  `-LoadReferenceData` copied the reference tables from the local database.
+
+### Known limits
+
+- The monolith (`services/eHubGo`) connects as the table owner and is outside
+  the contract; it is why several tables still have two writers.
+- Cross-domain reads are still SQL joins (`dispatch-service` reads orders,
+  addresses, businesses and users in single statements); removing them is a
+  separate workstream.
+- One database, one instance. Only `wallet` has a schema of its own.
+
+### Note
+
+`services/eHubGo` was not modified.
+
+---
+
+## [Unreleased] — 2026-10-17 — Dispatch hardening, KES fares, opt-in monolith
+
+Follow-up to the runtime smoke test: the defects it surfaced that live outside
+`services/eHubGo`.
+
+### Changed
+
+- **Fares are priced in KES.** `CalculateFare` hardcoded `currency: "USD"` and
+  `DefaultVehicleTiers` used USD-scale figures (2.50 base / 1.20 per km), while
+  the product is Kenyan — the monolith prices at 50 KES base / 20 KES per km in
+  `Ksh`. The tier table is converted at 20 KES per unit, which reproduces the
+  monolith's 50 KES base fare and preserves every tier ratio. An Economy trip of
+  5 km / 15 min now quotes 245 KES instead of a 5,373 "USD" number.
+- **Fuel surcharge defaults are unit-safe.** Both transports defaulted
+  `baseline_fuel_price` to `1.50` — a USD/gallon figure — so a Kenyan
+  `current_fuel_price=180` produced a 5,355 surcharge. The new
+  `services.ResolveFuelPrices` treats the current price as the baseline when no
+  baseline is supplied, so no surcharge is invented. The default minimum fare
+  moved from 5 to 50 (the Economy base fare).
+- `infra/docker-compose.yml`: `ehubgo` now sits behind a `monolith` profile.
+  `docker compose up` starts the extracted stack; `docker compose --profile
+  monolith up` opts in to the monolith. Nothing depends on it.
+
+### Fixed
+
+- `EligibleDriverIDs` compared `service_type` against `drivers.vehicle_type_id`
+  / `vehicle_types.name`, but the apps send service categories (`taxi`,
+  `motorbike`), so nearby-driver searches returned nothing. The filter now
+  applies only when `service_type` actually names a known vehicle type.
+- Driver `status` for a user without a `drivers` row returned 503 from both
+  transports; both now map `db.ErrDriverNotFound` to 404.
+- The legacy geo fallback aborted the entire nearby-driver search when Redis did
+  not implement `GEORADIUS_RO` (Redis < 3.2, or a compatible server). It is now
+  skipped on "unknown command"; the H3 index remains the primary path.
+- The legacy geo query asked for distances but not coordinates, so drivers taken
+  from the legacy `drivers:active` index were reported at 0,0. It now requests
+  coordinates (`WithCoord`).
+
+### Verification
+
+- `go build ./...` and `go test ./...` pass in `dispatch-service`; the pricing
+  tests were updated to the KES tariff and a `ResolveFuelPrices` test added.
+- Through the gateway: `service_type=taxi` / `motorbike` / `Sedan` all return the
+  seeded driver; a user without a driver profile gets 404; fare estimates return
+  KES 245 / 369 / 562 with a zero fuel surcharge.
+- `docker compose config --services` excludes `ehubgo`; with
+  `--profile monolith` it is included.
+
+### Note
+
+`services/eHubGo` was not modified.
+
+---
+
+## [Unreleased] — 2026-10-17 — Runtime smoke test of the gateway stack
+
+First end-to-end run of the extracted stack. Everything before this had been
+verified statically (`tsc`, `go test`, `docker compose config`); this brought the
+services up and drove real HTTP requests through the gateway using a locally
+minted session JWT (so protected routes could be exercised without Firebase).
+
+### Added
+
+- `infra/docker-compose.yml`: Postgres now runs `postgis/postgis:15-3.4-alpine`
+  and mounts an ordered `/docker-entrypoint-initdb.d` set — `eHubGo/schema.sql`,
+  the eHubGo attributes migration, the wallet migration and the c2c listing
+  policies — so a fresh `docker compose up` creates the full 63-table schema.
+  Previously the stack used plain `postgres:15-alpine`, which cannot create the
+  four `GEOGRAPHY` columns, and loaded no schema at all: the database came up
+  empty and no service could work.
+  - `services/eHubGo/migrations/002_add_is_featured_to_products.sql` is
+    deliberately **not** applied — it drops `products.is_flash_sale`, a column
+    `schema.sql` defines and `SearchProducts` queries.
+
+### Fixed
+
+- `services/dispatch-service/db/tasks.go`: the driver task feed could never
+  return a row. The `taxi_trips` branch selected
+  `u.first_name || ' ' || u.last_name` without joining `users`, so every
+  `GET /dispatch/driver/tasks` failed with
+  `pq: missing FROM-clause entry for table "u"` and surfaced as HTTP 503. It now
+  uses a `LEFT JOIN` with a `'Customer'` fallback (the same placeholder the
+  delivery branch already used), which also keeps the task visible when `users`
+  RLS hides the passenger row from the driver.
+
+### Verified against the running stack
+
+- `GET /health`, `POST /auth/validate` (valid and invalid tokens), and
+  `POST /auth/sync` (401 on a bogus Firebase token, with the service account
+  configured).
+- Marketplace: product list, `featured` filter, product detail, 404 for a
+  missing product, categories, listings. Wire shapes match the typed client:
+  `{"products": [...]}` / `{"product": {...}}`, protojson `snake_case`, numerics
+  as strings.
+- Dispatch: `estimate-fare`, `nearby-businesses`, `nearby-drivers` and
+  `find-driver` (a seeded driver with an indexed location was returned), driver
+  `status`/`location`/`tasks` after seeding a `drivers` row.
+- Wallet and BFF: `POST /wallet/accounts`, `GET /wallet/balance`,
+  `GET /wallet/transactions`, `GET /me/home`.
+- Auth boundary: 401 without a token, 403 without the `driver` role.
+- Empty results are served as `{}` (protojson omits empty lists / zero values);
+  the typed clients already treat those as empty collections, so no client fix
+  was needed.
+
+### Known issues found (not fixed)
+
+- **`services/eHubGo` does not compile**: import cycle
+  `handlers` → `handlers/ehost` → `handlers` (the `ehost` package imports
+  `handlers.WithRLS`). This blocks the monolith container and every
+  un-extracted route; out of scope while `eHubGo` stays read-only.
+- **Port collision on 6379**: a native Redis 3.0 for Windows shadows Docker's
+  published port, so host-run services silently talk to the old server. It lacks
+  `GEORADIUS_RO`, and the dispatch service's "legacy geo" fallback treats that as
+  fatal, turning `nearby-drivers` into a 500. The H3 index is the primary path;
+  the optional fallback arguably should degrade instead of failing the request.
+- **Fare pricing is US-denominated**: breakdowns report `currency: "USD"` and
+  default `baseline_fuel_price` to `1.50`, so a Kenyan `current_fuel_price=180`
+  produces a nonsense surcharge (5355 on a 5 km trip). Needs a pricing decision
+  rather than a code tweak.
+- **`service_type` semantics**: `EligibleDriverIDs` compares the caller's
+  `service_type` against `drivers.vehicle_type_id` / `vehicle_types.name`, while
+  the app sends `taxi` / `motorbike`. It only matches when vehicle types are
+  literally named that way.
+- Driver `status` for a user with no `drivers` row returns 503 (not 404/409),
+  while `driver/location` succeeds without one because it only writes to Redis.
+- The dev stack connects as the Postgres superuser, so RLS policies are bypassed
+  (they only take effect under a non-superuser role).
+
+---
+
+## [Unreleased] — 2026-10-17 — Frontend API calls: correct backends, real data, typed layer
+
+The mobile apps now call the right backend for each domain and render real
+responses instead of mocked data.
+
+### Added
+
+- `apps/ehub/packages/services/types.ts`: shared entity/payload types (session, catalog, marketplace listings, wallet, dispatch, and the monolith verticals), replacing `any` in the API layer.
+- `api` facade methods: `searchProducts`, `getBrands`, `getModels`, `getMe`, `getMyMall`, `getWalletTransactions`, `walletTopUp`, `walletPayout`, `createWallet`, `getC2CListing`.
+- `gatewayClient`: `home` (BFF aggregate), `getWalletTransactions`, `walletTopUp`, `walletPayout`, `createWallet`, `validateToken`.
+
+### Fixed
+
+- `api.searchProducts` did not exist, so the search screen could never load results; it now calls `GET /products/search?q=&limit=`.
+- Wrong-branch calls: `getServicesByType` → `GET /services/{type}` (was `/services?type=`, unregistered) and `calculateDeliveryQuote` → `POST /delivery/pricing/estimate` (was `/delivery/quote`, unregistered).
+- `getDriverTasks` now reads the extracted dispatch service through the gateway instead of the monolith.
+- Removed methods that pointed at non-existent monolith routes: `register`, `getHubs`, `createHub`, `getTasks`, `createTask`, `createDriver`, `createCinemaHall`, `listCinemaHalls`; `createMovie` retargeted to `POST /movies`.
+- Session identity: the `/auth/sync` user blob is normalised so `id`/`uid`/`name`/`displayName` all resolve, fixing `session.user.uid` / `session.user.id` reads in the store, orders and social screens.
+- `shop/product/[id].tsx` read a non-existent `data.images` field; images now come from `image_urls`.
+- `miniservices/ecinema.tsx` read `res.data` on a response that is a bare array.
+- `TaxiMap`: tracked-driver and nearby-driver responses are now normalised from the real `Driver` row (including the raw `last_location` value); tracking previously read fields the backend never sent.
+- `apps/dispatch`: `updateDriverLocation` treats the gateway (dispatch-service) write as authoritative and mirrors to the monolith best-effort, so a monolith hiccup can no longer take the driver offline.
+- `food-items/[id].tsx` guards a null `business_id`; `taxi.tsx` guards a missing place lookup.
+
+### Changed
+
+- Mocked screen data replaced with real calls: `miniservices/epay.tsx` → wallet transactions, `miniservices/ehealth.tsx` → `getMe`, `c2c-listings/new.tsx` → live categories/brands, `listings/stay/[id].tsx` → `getProperty`, `(tabs)/store.tsx` shop tab → `getMyMall` + `getBusinessProducts`, `miniservices/ehost.tsx` maps `Property` onto its view model.
+- `(tabs)/index.tsx`: added a live flash-sale countdown, removed the hard-coded loyalty-points badge (no points endpoint exists), and wired the wallet quick actions to the wallet screen.
+
+### Notes / known debt
+
+- These monolith routes are still unregistered, so their client methods will 404 until the backend catches up: `getAttributes` (`/attributes`), `getAttributeValues` (`/attributes/:id/values`), `getAddresses` (`/addresses`), `bookBusTicket` (`/bus/tickets`). Call sites already degrade gracefully.
+- `c2c-listings/new.tsx` still uses a placeholder image URL: `expo-image-picker` is not installed, so no real device upload exists yet.
+- `(tabs)/store.tsx` listing "sold"/"delete" actions remain local-only; no backend endpoint exists for either.
+
+### Verification
+
+- `npx tsc --noEmit` in `apps/ehub`: 130 → 129 errors with no new errors. The remainder are pre-existing module-resolution failures (`lucide-react-native`, `@tensorflow/tfjs`) and one `@react-native-picker/picker` typing issue.
+- `apps/dispatch` typecheck unchanged by this work (its dependencies are not installed locally, so only module-resolution errors appear).
+
+---
+
+## [Unreleased] — 2026-10-17 — Backend ports moved off the frontend range
+
+Backends now use a dedicated local port block so they never clash with the dev
+servers: **9000s for HTTP**, **9100s for gRPC**. The frontends keep their
+framework defaults (Vite/SvelteKit `5173+`, Expo/Metro `8081+`).
+
+| Service | HTTP | gRPC |
+|---|---|---|
+| eHubGo | 9000 | — |
+| auth-service | 9001 | 9101 |
+| wallet-service | 9002 | 9102 |
+| dispatch-service | 9003 | 9103 |
+| fulfillment-service | 9004 | 9104 |
+| marketplace-b2b | 9005 | 9105 |
+| marketplace-c2c | 9006 | 9106 |
+| gateway | 9010 | — |
+
+### Changed
+
+- Service config defaults: auth-service, wallet-service, dispatch-service and fulfillment-service (`PORT`/`GRPC_PORT`), `services/gateway` (`PORT`), `marketplace-b2b`/`marketplace-c2c` (`src/main.ts`), and the `packages/clients` gRPC target defaults (`localhost:9101`–`9106`).
+- `infra/docker-compose.yml`: every published port, the services' `PORT`/`GRPC_PORT` values, the gateway's `*_GRPC_ADDR` targets, and each healthcheck URL.
+- Mobile apps: the `EXPO_PUBLIC_GATEWAY_URL` fallbacks in `gatewayClient.ts` / `driver-api.ts` and both `.env.example` files now use gateway `9010`.
+- Docs updated for the new ports: `README.md` (service table, dual-serving table, port-convention note, local-infrastructure section), `services/DISPATCH_LOCAL_SETUP.md`, `services/MARKETPLACE_LOCAL_SETUP.md`, and the wallet/dispatch/marketplace READMEs.
+
+### Notes
+
+- `services/eHubGo` is untouched; compose sets its `PORT` (and `APP_URL`) to `9000`.
+- Historical entries below keep their original `8080s`/`9080s` references.
+
+### Verification
+
+- Go: `packages/clients` and `services/gateway` tests pass; auth/wallet/dispatch/fulfillment `go test ./...` pass; `gofmt` clean.
+- NestJS: both marketplace services `nest build` pass.
+- `docker compose -f infra/docker-compose.yml config` validates and publishes `9000`–`9010` / `9101`–`9106`.
+
+---
+
+## [Unreleased] — 2026-10-17 — Local stack runs the whole system
+
+The local compose stack now brings up every extracted service, so the gateway's
+marketplace routes work out of the box.
+
+### Added
+
+- `marketplace-b2b` (8085 / gRPC 9085) and `marketplace-c2c` (8086 / gRPC 9086) in `infra/docker-compose.yml`, each with its own healthcheck. Their `node_modules` live in named volumes so the container's Linux install never clobbers the host's, and the repo `proto/` directory is mounted at `/proto` for runtime proto loading.
+- Healthchecks for `ehubgo`, `auth-service`, `wallet-service`, `dispatch-service`, `fulfillment-service` and `gateway`, so dependents wait on `service_healthy` before starting.
+
+### Changed
+
+- `services/MARKETPLACE_LOCAL_SETUP.md` rewritten for the gateway-first setup: public read routes, `EXPO_PUBLIC_GATEWAY_URL`, and compose-based startup.
+- `README.md` local-infrastructure section now lists the marketplace services and the healthcheck behaviour.
+
+### Verification
+
+- `docker compose -f infra/docker-compose.yml config` validates.
+
+---
+
+## [Unreleased] — 2026-10-17 — Mobile apps routed through the gateway
+
+The mobile apps now reach the extracted services exclusively through
+`services/gateway`. The gateway and the underlying contracts were extended so it
+can serve the full surface the apps call, instead of the apps talking to each
+service directly.
+
+### Added
+
+- `apps/ehub/packages/services/gatewayClient.ts`: one HTTP/JSON client for the gateway that attaches the stored session token. `marketplaceClient` and `dispatchClient` are now thin adapters over it, so their app-facing surface is unchanged.
+- Gateway dispatch endpoints, with handler tests: `GET /dispatch/nearby-businesses`, `GET /dispatch/places/autocomplete`, `GET /dispatch/place/:id` (public), `POST /dispatch/delivery-requests` (authenticated) and `GET /dispatch/driver/tasks` (driver role).
+- `dispatch.DispatchService` RPCs `AutocompletePlaces`, `GetPlace`, `NearbyBusinesses`, `RequestDelivery` and `ListDriverTasks`, implemented in `dispatch-service` on top of its existing service/repository layer.
+- `marketplace` contract fields needed to mirror the read API: `Product.brand_id/model_id/brand_name/model_name/created_at/updated_at`, `Category.created_at/updated_at`, and `Listing.seller_avatar_url/created_at`.
+
+### Changed
+
+- `apps/ehub`: `api.syncUser` and `api.getWalletBalance` now go through the gateway; marketplace and dispatch calls are gateway-backed; the wallet available balance is mapped to the `balance` string the app expects.
+- `apps/dispatch`: driver sign-in, availability, location and active tasks use `EXPO_PUBLIC_GATEWAY_URL`; the ride/delivery request feeds still come from `eHubGo`.
+- `apps/ehub/.env.example` / `apps/dispatch/.env.example` now document `EXPO_PUBLIC_GATEWAY_URL`; the per-service `EXPO_PUBLIC_DISPATCH_URL` and marketplace URLs are no longer used.
+- `dispatch-service`'s gRPC server now takes a `grpcserver.Config` of collaborators, and its public-method allowlist includes the places/business discovery RPCs (`RequestDelivery`/`ListDriverTasks` stay authenticated).
+- `marketplace-b2b`/`marketplace-c2c` gRPC mappers emit the new contract fields.
+- `README.md` route, environment and status sections refreshed.
+
+### Fixed
+
+- `apps/ehub` sign-in/sign-up read `response.data` from an already-unwrapped response body, which left `persistBackendSession` with `undefined`; the flows now accept either shape.
+
+### Verification
+
+- Go: `dispatch-service` and `gateway` (`go build`/`vet`/`test`, including the new handler tests) pass; `packages/proto` builds; `packages/clients` tests pass.
+- NestJS: `marketplace-b2b` and `marketplace-c2c` `nest build` pass.
+- `proto`: `buf lint` clean; `buf generate` regenerated `packages/proto`.
+- Apps: `tsc --noEmit` reports only the pre-existing module-resolution errors (unresolved `@/…` path aliases and missing ambient types); no errors in the changed files.
+
+---
+
+## [Unreleased] — 2026-10-17
+
+Delivery of the gRPC foundation, unified service authentication, and the shared
+client layer plus HTTP gateway that ties the services together.
+
+### Added
+
+#### Protobuf contracts and code generation
+- `proto/` restructured to one package per service (`proto/<service>/<service>.proto`) with `buf.yaml` (`lint: STANDARD`, `PACKAGE_VERSION_SUFFIX` disabled) and `buf.gen.yaml`.
+- Contracts rewritten to mirror each service's **real** API for `auth`, `dispatch`, `fulfillment`, `wallet`, `marketplace` (split into `MarketplaceB2BService` and `MarketplaceC2CService`) and `spatial` (moved out of `services/eHubGo`).
+- `generate_protos.ts` now drives `buf generate` into the shared Go module.
+- New Go module `packages/proto` (module path `ehub/proto`) containing the generated `*.pb.go` / `*_grpc.pb.go` bindings for every contract.
+
+#### gRPC servers (dual-serving alongside HTTP)
+- New `grpcserver` packages for `auth-service` (gRPC `9081`), `wallet-service` (`9082`), `dispatch-service` (`9083`) and `fulfillment-service` (`9084`), delegating to the existing service/handler logic.
+- New gRPC front-ends for the NestJS services `marketplace-b2b` (`src/grpc.ts`, port `9085`) and `marketplace-c2c` (`src/grpc.ts`, port `9086`) using `@grpc/grpc-js` + `@grpc/proto-loader` (loading the same `.proto` at runtime).
+- `GRPC_PORT` added to each Go service's config; each `main.go` now starts both an HTTP and a gRPC front-end.
+- Shared logic extracted so HTTP and gRPC share one path: `AuthHandler.SyncUserCore`, `WalletHandler.InitTopUpCore` / `RequestPayoutCore`.
+
+#### Shared auth module — `packages/platform` (`ehub/platform`)
+- `auth/jwt.go`: session-JWT `Claims` and a `Validator` (`NewValidator`/`Generate`/`Parse`) that pins **HS256** and rejects unsigned/`alg=none`/foreign-signed tokens and tokens without a `user_id`.
+- `auth/gin.go`: `GinMiddleware`/`GinSession` (reads `Authorization: Bearer` and the `session_token` cookie; opt-in `?token=`), `DenyAll`, `GinRequireRole`, and token-extraction helpers.
+- `auth/grpc.go`: `UnaryInterceptor(publicMethods...)` with a per-method public allowlist, plus `UserIDFromContext` / `HasRole` helpers.
+- Unit tests covering token round-trips, wrong secret, `alg=none`, missing subject, Gin header/cookie/query carriers, the role guard, and the gRPC interceptor.
+
+#### Shared gRPC clients — `packages/clients` (`ehub/clients`)
+- `config.go`: `Config` + `DefaultConfig()` reading `AUTH_GRPC_ADDR`, `WALLET_GRPC_ADDR`, `DISPATCH_GRPC_ADDR`, `FULFILLMENT_GRPC_ADDR`, `MARKETPLACE_B2B_GRPC_ADDR`, `MARKETPLACE_C2C_GRPC_ADDR` (local ports by default).
+- `interceptor.go`: `WithSessionToken` / `SessionToken` and `UnaryClientInterceptor`, which forwards the caller's token as outgoing `authorization` + `session_token` metadata and applies a default deadline without overriding a caller-set one.
+- `clients.go`: `Clients` aggregates typed clients for all six services over lazily-connected channels; unconfigured services are skipped; `Close()` releases connections.
+- Tests for token/deadline propagation, preserved caller deadlines, and defaults.
+
+#### Gateway service — `services/gateway` (HTTP `8090`)
+- New HTTP/JSON entry point that validates the session JWT, then calls the owning service over gRPC via `packages/clients`, forwarding the caller's token so each service re-validates it (defence in depth).
+- Routes (all under `/api/v1/gateway`):
+  - **Public:** `POST /auth/sync`, `POST /auth/validate`, `POST /dispatch/find-driver`, `GET /dispatch/estimate-fare`, `GET /dispatch/nearby-drivers`, and marketplace reads (`/marketplace/products`, `/marketplace/products/:id`, `/marketplace/categories`, `/marketplace/listings`, `/marketplace/listings/:id`).
+  - **Authenticated:** wallet (`/wallet/balance`, `POST /wallet/accounts`, `POST /wallet/topup`, `POST /wallet/payout`, `/wallet/transactions`), fulfillment (`/fulfillment/orders/:id/status`, `POST /fulfillment/orders/:id/assign-driver`, `POST /fulfillment/orders/:id/status`), and `POST /marketplace/listings`.
+  - **Driver-only:** `PUT /dispatch/driver/location`, `PUT /dispatch/driver/status`.
+- BFF aggregate `GET /me/home`: concurrently fans out to the wallet (and dispatch when `lat`/`lng` are supplied) and returns a combined payload, reporting any failed section without failing the whole request.
+- JSON bodies/responses use `protojson` with proto field names, mirroring the contract; gRPC statuses map onto HTTP codes.
+- Handler tests with fake clients, plus an end-to-end test that runs a real gRPC server with the shared interceptor and drives it through `clients.New` over a real socket.
+
+### Changed
+
+- The four Go services now serve **both** HTTP/JSON and gRPC from one process and import `ehub/proto`, `ehub/platform` and (for the gateway) `ehub/clients` via `replace` directives.
+- `fulfillment-service` HTTP routes now go through the shared session middleware (see Security).
+- `infra/docker-compose.yml`: Go image bumped to `golang:1.26-alpine`; `packages/proto`, `packages/platform` and `packages/clients` mounted into the relevant services; gRPC ports published; new `gateway` service (`8090`) wired to the four Go services.
+- `README.md`: contracts table, generated-module description, HTTP/gRPC port table, a “Service authentication” section, a “Service-to-service gRPC and the gateway” section, and refreshed status/gaps.
+
+### Security
+
+- **gRPC surface is now authenticated.** The gRPC servers previously accepted unauthenticated calls, and several RPCs take a `user_id`/`driver_id` in the payload (e.g. wallet top-up/payout). Every Go gRPC server now runs the shared interceptor; only intentional public RPCs are exempt. Handlers derive the caller's identity from the token and reject a mismatched payload id.
+- **`fulfillment-service` HTTP auth was a no-op stub** that accepted every request as `system-user`. It now validates the session token like the other services (a valid JWT is required).
+- **Algorithm-confusion hardening:** all JWT validation now pins `HS256` and rejects `alg=none`/unsigned tokens.
+- `marketplace-c2c` now shares one HS256 verification implementation (`src/security/session.ts`) between its HTTP guard and its gRPC `CreateListing` handler, which requires a valid session token and derives the seller from it.
+
+### Notes
+
+- `@grpc/grpc-js` / `@grpc/proto-loader` resolve from the root `node_modules`; `grpc-js` 1.9.x requires `server.start()` after `bindAsync`.
+- The marketplace (NestJS) services are not part of `infra/docker-compose.yml`; start them separately (see `services/MARKETPLACE_LOCAL_SETUP.md`) and point the gateway at their gRPC ports.
+
+### Verification
+
+- `packages/proto`: `go build ./...`.
+- `packages/platform`: `go vet`, `go test ./...` pass.
+- `packages/clients`: `go vet`, `go test ./...` pass.
+- `services/gateway`: `go build`, `go vet`, `go test ./...` pass (including the end-to-end client↔server test).
+- `services/auth-service`, `services/wallet-service`, `services/dispatch-service`, `services/fulfillment-service`: `go build`, `go vet`, `go test ./...` pass.
+- `services/marketplace-b2b`, `services/marketplace-c2c`: `npm run build` pass.
+- `proto`: `buf lint` clean.
+- `infra/docker-compose.yml`: `docker compose config` valid.
